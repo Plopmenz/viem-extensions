@@ -1,19 +1,19 @@
 import {
-  BaseError,
-  ContractFunctionRevertedError,
   type Abi,
   type Account,
   type Chain,
   type ContractFunctionArgs,
   type ContractFunctionName,
+  type PrepareTransactionRequestParameters,
+  type PrepareTransactionRequestRequest,
   type PublicClient,
   type RpcSchema,
+  type SendTransactionReturnType,
   type SimulateContractParameters,
   type Transport,
   type WaitForTransactionReceiptParameters,
   type WaitForTransactionReceiptReturnType,
   type WalletClient,
-  type WriteContractParameters,
   type WriteContractReturnType,
 } from "viem";
 import {
@@ -23,6 +23,33 @@ import {
   defaultOnUpdate,
   type Loggers,
 } from "./loggers.js";
+import {
+  getContractHandler,
+  type ContractHandlerInput,
+} from "./transactionHandlers/contractHandler.js";
+import type {
+  TransactionHandler,
+  TransactionHandlerSettings,
+} from "./transactionHandlers/transactionHandler.js";
+import {
+  getRawTransactionHandler,
+  type RawTransactionHandlerInput,
+} from "./transactionHandlers/rawTransactionHandler.js";
+
+export type TransactionTypes<
+  abi extends Abi | readonly unknown[] = Abi,
+  functionName extends ContractFunctionName<
+    abi,
+    "nonpayable" | "payable"
+  > = ContractFunctionName<abi, "nonpayable" | "payable">,
+  args extends ContractFunctionArgs<
+    abi,
+    "nonpayable" | "payable",
+    functionName
+  > = ContractFunctionArgs<abi, "nonpayable" | "payable", functionName>,
+> =
+  | SimulateContractParameters<abi, functionName, args>
+  | PrepareTransactionRequestParameters;
 
 export interface PerformTransactionParameters<
   abi extends Abi | readonly unknown[] = Abi,
@@ -53,9 +80,11 @@ export interface PerformTransactionParameters<
 
   loggers?: Loggers;
   transaction: () => Promise<
-    SimulateContractParameters<abi, functionName, args> | undefined
+    TransactionTypes<abi, functionName, args> | undefined
   >;
-  onSubmitted?: (transactionHash: WriteContractReturnType) => void;
+  onSubmitted?: (
+    transactionHash: WriteContractReturnType | SendTransactionReturnType
+  ) => void;
   onConfirmed?: (receipt: WaitForTransactionReceiptReturnType<chain>) => void;
 
   transactionName?: string;
@@ -115,52 +144,104 @@ export async function performTransaction<
     return;
   }
 
+  let handler: TransactionHandler<{}, any>;
+
+  if (isContractCall(transaction)) {
+    const internalHandler = getContractHandler<
+      abi,
+      functionName,
+      args,
+      chain,
+      account,
+      pcTransport,
+      pcAccountOrAddress,
+      pcRpcSchema,
+      wcTransport,
+      wcRpcSchema
+    >();
+    const input: ContractHandlerInput<
+      abi,
+      functionName,
+      args,
+      chain,
+      account,
+      pcTransport,
+      pcAccountOrAddress,
+      pcRpcSchema,
+      wcTransport,
+      wcRpcSchema
+    > = {
+      publicClient: params.publicClient,
+      walletClient: params.walletClient,
+      contractCall: transaction,
+    };
+    handler = {
+      simulate(_, settings) {
+        return internalHandler.simulate(input, settings);
+      },
+      submit(input, settings) {
+        return internalHandler.submit(input, settings);
+      },
+    };
+  } else if (isRawCall<abi, functionName, args>(transaction)) {
+    const internalHandler = getRawTransactionHandler<
+      chain,
+      account,
+      PrepareTransactionRequestRequest<chain, chain>,
+      pcTransport,
+      pcAccountOrAddress,
+      pcRpcSchema,
+      wcTransport,
+      wcRpcSchema
+    >();
+    const input: RawTransactionHandlerInput<
+      chain,
+      account,
+      PrepareTransactionRequestRequest<chain, chain>,
+      pcTransport,
+      pcAccountOrAddress,
+      pcRpcSchema,
+      wcTransport,
+      wcRpcSchema
+    > = {
+      publicClient: params.publicClient,
+      walletClient: params.walletClient,
+      rawCall: transaction as PrepareTransactionRequestParameters<
+        chain,
+        account,
+        chain,
+        account,
+        PrepareTransactionRequestRequest<chain, chain>
+      >,
+    };
+    handler = {
+      simulate(_, settings) {
+        return internalHandler.simulate(input, settings);
+      },
+      submit(input, settings) {
+        return internalHandler.submit(input, settings);
+      },
+    };
+  } else {
+    loggers.onError?.({
+      title: `${transactionName} failed`,
+      description:
+        "Input was not recognized as contract call or raw transaction.",
+    });
+    return;
+  }
+
+  const handlerSettings: TransactionHandlerSettings = {
+    loggers: loggers,
+    transactionName: transactionName,
+    simulate: simulate,
+  };
   loggers.onUpdate?.({
     title: "Simulating transaction",
     description: "Please wait for the simulation to finish...",
   });
-  const transactionRequest = simulate
-    ? await params.publicClient
-        .simulateContract({
-          account: params.walletClient.account,
-          chain: params.walletClient.chain,
-          ...transaction,
-        } as SimulateContractParameters<
-          abi,
-          functionName,
-          args,
-          chain,
-          chain,
-          account
-        >)
-        .catch((err) => {
-          let errorName = "Simulation failed.";
-          if (err instanceof BaseError) {
-            errorName = err.shortMessage ?? errorName;
-            const revertError = err.walk(
-              (err) => err instanceof ContractFunctionRevertedError
-            );
-            if (revertError instanceof ContractFunctionRevertedError) {
-              errorName += revertError.data?.errorName
-                ? ` -> ${revertError.data.errorName}`
-                : "";
-            }
-          }
-          loggers.onError?.({
-            title: `${transactionName} failed`,
-            description: errorName,
-            error: err,
-          });
-          return undefined;
-        })
-    : {
-        request: {
-          account: params.walletClient.account,
-          chain: params.walletClient.chain,
-          ...transaction,
-        },
-      };
-  if (transactionRequest === undefined) {
+  const handlerRequest = await handler.simulate({}, handlerSettings);
+  if (handlerRequest === undefined) {
     return;
   }
 
@@ -168,24 +249,7 @@ export async function performTransaction<
     title: "Generating transaction",
     description: "Please sign the transaction in your wallet...",
   });
-  const transactionHash = await params.walletClient
-    .writeContract(
-      transactionRequest.request as WriteContractParameters<
-        abi,
-        functionName,
-        args,
-        chain,
-        account
-      >
-    )
-    .catch((err) => {
-      loggers.onError?.({
-        title: `${transactionName} failed`,
-        description: "Transaction rejected.",
-        error: err,
-      });
-      return undefined;
-    });
+  const transactionHash = await handler.submit(handlerRequest, handlerSettings);
   if (transactionHash === undefined) {
     return;
   }
@@ -211,4 +275,43 @@ export async function performTransaction<
     description: `${transactionName} performed successfully.`,
   });
   params.onConfirmed?.(receipt);
+}
+
+export function isContractCall<
+  abi extends Abi | readonly unknown[] = Abi,
+  functionName extends ContractFunctionName<
+    abi,
+    "nonpayable" | "payable"
+  > = ContractFunctionName<abi, "nonpayable" | "payable">,
+  args extends ContractFunctionArgs<
+    abi,
+    "nonpayable" | "payable",
+    functionName
+  > = ContractFunctionArgs<abi, "nonpayable" | "payable", functionName>,
+>(
+  transaction: TransactionTypes<abi, functionName, args>
+): transaction is SimulateContractParameters<abi, functionName, args> {
+  return (
+    (transaction as SimulateContractParameters<abi, functionName, args>).abi !==
+    undefined
+  );
+}
+
+export function isRawCall<
+  abi extends Abi | readonly unknown[] = Abi,
+  functionName extends ContractFunctionName<
+    abi,
+    "nonpayable" | "payable"
+  > = ContractFunctionName<abi, "nonpayable" | "payable">,
+  args extends ContractFunctionArgs<
+    abi,
+    "nonpayable" | "payable",
+    functionName
+  > = ContractFunctionArgs<abi, "nonpayable" | "payable", functionName>,
+>(
+  transaction: TransactionTypes<abi, functionName, args>
+): transaction is PrepareTransactionRequestParameters {
+  return (
+    (transaction as PrepareTransactionRequestParameters).data !== undefined
+  );
 }
